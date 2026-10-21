@@ -1020,7 +1020,7 @@ if all([csv_file, template_file, sainsbury_template, tesco_template, coop_templa
                 st.download_button(
                     "Download populated Sainsbury's workbook",
                     data=st.session_state["sains_report_bytes"],
-                    file_name="sainsburys_report_updated.xlsx",
+                    file_name="Sainsburys_updated.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_sainsbury",
                 )
@@ -1041,7 +1041,7 @@ if all([csv_file, template_file, sainsbury_template, tesco_template, coop_templa
                 st.download_button(
                     "Download populated Waitrose workbook",
                     data=st.session_state["waitrose_report_bytes"],
-                    file_name="waitrose_report_updated.xlsx",
+                    file_name="Waitrose_updated.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_waitrose",
                 )
@@ -1062,7 +1062,7 @@ if all([csv_file, template_file, sainsbury_template, tesco_template, coop_templa
                 st.download_button(
                     "Download populated The Co-operative workbook",
                     data=st.session_state["coop_report_bytes"],
-                    file_name="cooperative_report_updated.xlsx",
+                    file_name="The Co-operative_updated.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_coop",
                 )
@@ -1083,7 +1083,7 @@ if all([csv_file, template_file, sainsbury_template, tesco_template, coop_templa
                 st.download_button(
                     "Download populated Tesco workbook",
                     data=st.session_state["tesco_report_bytes"],
-                    file_name="tesco_report_updated.xlsx",
+                    file_name="Tesco_updated.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_tesco",
                 )
