@@ -1,3 +1,931 @@
+from __future__ import annotations
+
+from io import BytesIO
+import re
+import copy
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+
+st.set_page_config(page_title="Client Audit Reporting", page_icon="📊", layout="wide")
+
+REPORT_SHEETS = {
+    "2026 Indy": {
+        "description": "E-Cig - No ID audits for IND, BAT, C0 and WHSmith sites.",
+        "item_to_order": "E-Cig - No ID",
+        "filter": "indy",
+    },
+    "2026 Qcomm": {
+        "description": "Rapid Delivery audits at sites already listed in the Qcomm sheet.",
+        "item_to_order": "Rapid Delivery",
+        "filter": "site_match",
+    },
+    "2026 16-17 YOs": {
+        "description": "Home Delivery audits at sites already listed in the 16-17 YOs sheet.",
+        "item_to_order": "Home Delivery",
+        "filter": "site_match",
+    },
+}
+
+REQUIRED_SOURCE_COLUMNS = {"internal_id", "site_name", "item_to_order", "site_code"}
+
+
+def norm(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def get_headers(ws):
+    return [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
+
+
+def get_site_names(ws) -> set[str]:
+    # Existing report sheets use site_name in column B.
+    return {
+        norm(ws.cell(row, 2).value)
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, 2).value not in (None, "")
+    }
+
+
+def is_whsmith(row) -> bool:
+    site_name = str(row.get("site_name", ""))
+    site_code = str(row.get("site_code", ""))
+    return bool(re.search(r"wh\s*smith", site_name, re.I) or
+                re.search(r"wh\s*smith", site_code, re.I))
+
+
+def filter_for_sheet(df: pd.DataFrame, sheet_name: str, ws):
+    cfg = REPORT_SHEETS[sheet_name]
+    mask = df["item_to_order"].astype(str).str.strip().eq(cfg["item_to_order"])
+
+    if cfg["filter"] == "indy":
+        code = df["site_code"].astype(str).str.strip().str.upper()
+        prefixes = code.str.startswith(("IND", "BAT", "C0"))
+        whsmith = df.apply(is_whsmith, axis=1)
+        mask = mask & (prefixes | whsmith)
+        return df.loc[mask].copy(), df.loc[~mask].copy()
+
+    sites = get_site_names(ws)
+    names = df["site_name"].map(norm)
+    selected = mask & names.isin(sites)
+
+    # For 16-17 YOs Home Delivery, include sibling audits sharing the same
+    # order_internal_id as an audit already eligible by site name. This captures
+    # multi-audit orders (e.g. Totally Wicked) without broadening other reports.
+    if sheet_name == "2026 16-17 YOs" and "order_internal_id" in df.columns:
+        order_ids = set(
+            df.loc[selected, "order_internal_id"].astype(str).str.strip()
+            .loc[lambda values: values.ne("")]
+        )
+        order_match = df["order_internal_id"].astype(str).str.strip().isin(order_ids)
+        selected = selected | (mask & order_match)
+
+    return df.loc[selected].copy(), df.loc[mask & ~selected].copy()
+
+
+def set_cell_value(cell, value, header):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        cell.value = None
+        return
+    if header == "date_of_visit":
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+        cell.value = parsed.to_pydatetime() if pd.notna(parsed) else str(value)
+    elif header == "time_of_visit":
+        parsed = pd.to_datetime(str(value), errors="coerce")
+        cell.value = parsed.time() if pd.notna(parsed) else str(value)
+    else:
+        cell.value = str(value) if not isinstance(value, (int, float, bool)) else value
+
+
+def append_rows(ws, records: pd.DataFrame) -> tuple[int, int]:
+    headers = get_headers(ws)
+    existing_ids = {
+        str(ws.cell(row, 1).value).strip()
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, 1).value not in (None, "")
+    }
+    # Use source internal_id to avoid adding the same audit twice.
+    pending = records.loc[~records["internal_id"].astype(str).str.strip().isin(existing_ids)]
+    added = 0
+
+    for _, record in pending.iterrows():
+        row_num = ws.max_row + 1
+        template_row = row_num - 1 if row_num > 2 else 2
+
+        for col_num, header in enumerate(headers, start=1):
+            if not header:
+                continue
+            key = str(header).strip()
+            value = record.get(key, "")
+
+            # Handle legacy workbook question wording while keeping workbook headers unchanged.
+            legacy_map = {
+                "Was your transaction allowed to go through?":
+                    "Was your transaction allowed to go through initially?",
+                "Please detail how your purchase was refused:":
+                    "Please detail how your purchase was refused during checkout:",
+                "Please upload a photo of your full receipt showing any visible codes:":
+                    "Please upload a screenshot of your receipt image which includes your order number:",
+            }
+            if (value == "" or value is None) and key in legacy_map:
+                value = record.get(legacy_map[key], "")
+
+            cell = ws.cell(row=row_num, column=col_num)
+            set_cell_value(cell, value, key)
+
+            if template_row >= 2 and template_row <= ws.max_row:
+                source_cell = ws.cell(row=template_row, column=col_num)
+                if source_cell.has_style:
+                    cell._style = copy.copy(source_cell._style)
+                if source_cell.number_format:
+                    cell.number_format = source_cell.number_format
+                if source_cell.alignment:
+                    cell.alignment = copy.copy(source_cell.alignment)
+                if source_cell.protection:
+                    cell.protection = copy.copy(source_cell.protection)
+        added += 1
+
+    return added, len(pending)
+
+
+
+def update_pass_percent_sheet(wb, df: pd.DataFrame):
+    """Update monthly Pass % metrics for months represented in the current export."""
+    ws = wb["Pass %"]
+    # Each section maps to the row containing Visits, Pass, Fail, Abort, Pass Rate.
+    sections = {
+        "2026 16-17 YOs": {"start_row": 5, "item": "Home Delivery", "kind": "site_match"},
+        "2026 Qcomm": {"start_row": 13, "item": "Rapid Delivery", "kind": "site_match"},
+        "2026 Indy": {"start_row": 21, "item": "E-Cig - No ID", "kind": "indy"},
+    }
+
+    if "date_of_visit" not in df.columns or "primary_result" not in df.columns:
+        raise ValueError("The audit export must contain date_of_visit and primary_result to update Pass %.")
+
+    dates = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce")
+    month_columns = {}
+    for col in range(2, ws.max_column + 1):
+        month = str(ws.cell(4, col).value or "").strip().upper()
+        if month:
+            month_columns[month[:3]] = col
+
+    summary = {}
+    for sheet_name, cfg in sections.items():
+        if sheet_name not in wb.sheetnames:
+            continue
+        selected, _ = filter_for_sheet(df, sheet_name, wb[sheet_name])
+        selected = selected.copy()
+        selected["_parsed_date"] = pd.to_datetime(
+            selected["date_of_visit"], dayfirst=True, errors="coerce"
+        )
+        selected["_month"] = selected["_parsed_date"].dt.strftime("%b").str.upper()
+        selected["_result"] = selected["primary_result"].astype(str).str.strip().str.casefold()
+
+        # Only touch month columns for which this export has relevant records.
+        months_in_export = sorted(
+            set(selected.loc[selected["_parsed_date"].notna(), "_month"]),
+            key=lambda m: list(month_columns).index(m) if m in month_columns else 99
+        )
+        for month in months_in_export:
+            if month not in month_columns:
+                continue
+            col = month_columns[month]
+            month_rows = selected[selected["_month"] == month]
+            passes = int(month_rows["_result"].isin(["pass", "passed"]).sum())
+            fails = int(month_rows["_result"].isin(["fail", "failed"]).sum())
+            aborts = int(month_rows["_result"].isin(["abort", "aborted"]).sum())
+            visits = passes + fails + aborts
+            base = cfg["start_row"]
+            ws.cell(base, col).value = visits
+            ws.cell(base + 1, col).value = passes
+            ws.cell(base + 2, col).value = fails
+            ws.cell(base + 3, col).value = aborts
+            letter = ws.cell(1, col).column_letter
+            ws.cell(base + 4, col).value = f"=IFERROR({letter}{base+1}/({letter}{base}-{letter}{base+3}),0)"
+            summary[f"{sheet_name} - {month}"] = {
+                "Visits": visits, "Pass": passes, "Fail": fails, "Abort": aborts
+            }
+    return summary
+
+
+def workbook_bytes(template_file, df):
+    template_file.seek(0)
+    wb = load_workbook(template_file)
+    results = {}
+    unmatched = {}
+
+    for sheet_name in REPORT_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Template is missing the required worksheet: {sheet_name}")
+        selected, unmatched_rows = filter_for_sheet(df, sheet_name, wb[sheet_name])
+        added, duplicates_removed = append_rows(wb[sheet_name], selected)
+        results[sheet_name] = {
+            "matching_source_records": len(selected),
+            "new_rows_added": added,
+            "already_present": len(selected) - added,
+        }
+        unmatched[sheet_name] = unmatched_rows
+
+    pass_summary = update_pass_percent_sheet(wb, df)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, results, unmatched, pass_summary
+
+
+
+def sainsbury_online_mask(df: pd.DataFrame):
+    site_names = df["site_name"].astype(str)
+    sainsbury_name = site_names.str.contains(r"sainsbur(?:y|ies)", case=False, regex=True, na=False)
+    return df["item_to_order"].astype(str).str.strip().eq("Home Delivery") & sainsbury_name
+
+
+def sainsbury_retail_mask(df: pd.DataFrame):
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    retail_code = df["site_code"].astype(str).str.strip().str.upper().str.startswith("SAI")
+    online_items = df["item_to_order"].astype(str).str.strip().str.casefold().isin(
+        {"home delivery", "rapid delivery", "compliance audit"}
+    )
+    return year_2026 & retail_code & ~online_items
+
+
+def append_sainsbury_rows(ws, records: pd.DataFrame, retail=False):
+    headers = get_headers(ws)
+    id_header = "ID" if retail else "internal_id"
+    existing_ids = {
+        str(ws.cell(row, 1).value).strip()
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, 1).value not in (None, "")
+    }
+    pending = records.loc[~records["internal_id"].astype(str).str.strip().isin(existing_ids)]
+    for _, record in pending.iterrows():
+        row_num = ws.max_row + 1
+        template_row = row_num - 1
+        for col_num, header in enumerate(headers, start=1):
+            if not header:
+                continue
+            key = str(header).strip()
+            source_key = "internal_id" if key == id_header else key
+            value = record.get(source_key, "")
+            cell = ws.cell(row=row_num, column=col_num)
+            set_cell_value(cell, value, key)
+            if template_row >= 2 and template_row < row_num:
+                source_cell = ws.cell(row=template_row, column=col_num)
+                if source_cell.has_style:
+                    cell._style = copy.copy(source_cell._style)
+                if source_cell.number_format:
+                    cell.number_format = source_cell.number_format
+                if source_cell.alignment:
+                    cell.alignment = copy.copy(source_cell.alignment)
+                if source_cell.protection:
+                    cell.protection = copy.copy(source_cell.protection)
+    return len(pending)
+
+
+def update_sainsbury_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.DataFrame):
+    ws = wb["Summary"]
+    # Existing summary structure: Retail rows 4-8; Online rows 11-15.
+    sections = [
+        (retail_rows, 4),
+        (online_rows, 11),
+    ]
+    month_columns = {}
+    for col in range(2, 14):  # B:M = Jan:Dec
+        month = str(ws.cell(3, col).value or "").strip().upper()[:3]
+        if month:
+            month_columns[month] = col
+
+    updates = {}
+    for rows, start_row in sections:
+        if "date_of_visit" not in rows.columns:
+            continue
+        dated = rows.copy()
+        dated["_date"] = pd.to_datetime(dated["date_of_visit"], dayfirst=True, errors="coerce")
+        dated["_month"] = dated["_date"].dt.strftime("%b").str.upper()
+        dated["_result"] = dated["primary_result"].astype(str).str.strip().str.casefold()
+        for month in set(dated.loc[dated["_date"].notna(), "_month"]):
+            if month not in month_columns:
+                continue
+            col = month_columns[month]
+            mrows = dated[dated["_month"] == month]
+            passed = int(mrows["_result"].isin(["pass", "passed"]).sum())
+            failed = int(mrows["_result"].isin(["fail", "failed"]).sum())
+            aborted = int(mrows["_result"].isin(["abort", "aborted"]).sum())
+            ws.cell(start_row, col).value = passed + failed + aborted
+            ws.cell(start_row + 1, col).value = passed
+            ws.cell(start_row + 2, col).value = failed
+            ws.cell(start_row + 3, col).value = aborted
+            letter = ws.cell(1, col).column_letter
+            ws.cell(start_row + 4, col).value = (
+                f"=IFERROR({letter}{start_row+1}/({letter}{start_row}-{letter}{start_row+3}),0)"
+            )
+            updates[f"{'Retail' if start_row == 4 else 'Online'} - {month}"] = {
+                "Visits": passed + failed + aborted, "Pass": passed,
+                "Fail": failed, "Abort": aborted
+            }
+    return updates
+
+
+def build_sainsbury_workbook(template_file, df):
+    template_file.seek(0)
+    wb = load_workbook(template_file)
+    for required in ["Summary", "Online 26", "2026"]:
+        if required not in wb.sheetnames:
+            raise ValueError(f"Sainsbury's workbook is missing worksheet: {required}")
+
+    online = df.loc[sainsbury_online_mask(df)].copy()
+    retail = df.loc[sainsbury_retail_mask(df)].copy()
+    online_added = append_sainsbury_rows(wb["Online 26"], online, retail=False)
+    retail_added = append_sainsbury_rows(wb["2026"], retail, retail=True)
+    summary = update_sainsbury_summary(wb, retail, online)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, {
+        "Online 26 matching records": len(online),
+        "Online 26 new rows": online_added,
+        "2026 retail matching records": len(retail),
+        "2026 retail new rows": retail_added,
+    }, summary
+
+
+
+def tesco_retail_mask(df: pd.DataFrame):
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    tesco_code = df["site_code"].astype(str).str.strip().str.upper().str.startswith("TES")
+    online_items = df["item_to_order"].astype(str).str.strip().str.casefold().isin(
+        {"home delivery", "rapid delivery", "compliance audit"}
+    )
+    return year_2026 & tesco_code & ~online_items
+
+
+def tesco_online_mask(df: pd.DataFrame):
+    site_names = df["site_name"].astype(str).str.strip().str.lower()
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    return (
+        year_2026
+        & df["item_to_order"].astype(str).str.strip().eq("Home Delivery")
+        & site_names.str.contains(r"tesco\.co\.uk", regex=True, na=False)
+    )
+
+
+def append_tesco_rows(ws, records: pd.DataFrame, retail=False):
+    headers = get_headers(ws)
+    id_header = "ID" if retail else "internal_id"
+    id_col = headers.index(id_header) + 1 if id_header in headers else 1
+    existing_ids = {
+        str(ws.cell(row, id_col).value).strip()
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, id_col).value not in (None, "")
+    }
+    pending = records.loc[~records["internal_id"].astype(str).str.strip().isin(existing_ids)]
+    for _, record in pending.iterrows():
+        row_num = ws.max_row + 1
+        template_row = row_num - 1
+        for col_num, header in enumerate(headers, start=1):
+            if not header:
+                continue
+            key = str(header).strip()
+            source_key = "internal_id" if key == id_header else key
+            value = record.get(source_key, "")
+            cell = ws.cell(row=row_num, column=col_num)
+            set_cell_value(cell, value, key)
+            if template_row >= 2 and template_row < row_num:
+                source_cell = ws.cell(row=template_row, column=col_num)
+                if source_cell.has_style:
+                    cell._style = copy.copy(source_cell._style)
+                if source_cell.number_format:
+                    cell.number_format = source_cell.number_format
+                if source_cell.alignment:
+                    cell.alignment = copy.copy(source_cell.alignment)
+                if source_cell.protection:
+                    cell.protection = copy.copy(source_cell.protection)
+    return len(pending)
+
+
+def update_tesco_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.DataFrame):
+    ws = wb["Summary"]
+    sections = [(retail_rows, 4), (online_rows, 12)]
+    month_columns = {}
+    for col in range(2, 14):  # B:M = Jan:Dec
+        month = str(ws.cell(3 if col >= 2 else 3, col).value or "").strip().upper()[:3]
+        # Online section has its own month header on row 11.
+        if month:
+            month_columns[month] = col
+    online_month_columns = {
+        str(ws.cell(11, col).value or "").strip().upper()[:3]: col
+        for col in range(2, 14)
+        if ws.cell(11, col).value
+    }
+    updates = {}
+    for rows, start_row in sections:
+        cols = month_columns if start_row == 4 else online_month_columns
+        if "date_of_visit" not in rows.columns:
+            continue
+        dated = rows.copy()
+        dated["_date"] = pd.to_datetime(dated["date_of_visit"], dayfirst=True, errors="coerce")
+        dated["_month"] = dated["_date"].dt.strftime("%b").str.upper()
+        dated["_result"] = dated["primary_result"].astype(str).str.strip().str.casefold()
+        for month in sorted(set(dated.loc[dated["_date"].notna(), "_month"])):
+            if month not in cols:
+                continue
+            col = cols[month]
+            mrows = dated[dated["_month"] == month]
+            passed = int(mrows["_result"].isin(["pass", "passed"]).sum())
+            failed = int(mrows["_result"].isin(["fail", "failed"]).sum())
+            aborted = int(mrows["_result"].isin(["abort", "aborted"]).sum())
+            ws.cell(start_row, col).value = passed + failed + aborted
+            ws.cell(start_row + 1, col).value = passed
+            ws.cell(start_row + 2, col).value = failed
+            ws.cell(start_row + 3, col).value = aborted
+            letter = ws.cell(1, col).column_letter
+            ws.cell(start_row + 4, col).value = (
+                f"=IFERROR({letter}{start_row+1}/({letter}{start_row}-{letter}{start_row+3}),0)"
+            )
+            updates[f"{'Retail' if start_row == 4 else 'Online'} - {month}"] = {
+                "Visits": passed + failed + aborted, "Pass": passed,
+                "Fail": failed, "Abort": aborted
+            }
+    return updates
+
+
+def build_tesco_workbook(template_file, df):
+    template_file.seek(0)
+    wb = load_workbook(template_file)
+    for required in ["Summary", "Retail 2026", "Online 2026"]:
+        if required not in wb.sheetnames:
+            raise ValueError(f"Tesco workbook is missing worksheet: {required}")
+
+    retail = df.loc[tesco_retail_mask(df)].copy()
+    online = df.loc[tesco_online_mask(df)].copy()
+    retail_added = append_tesco_rows(wb["Retail 2026"], retail, retail=True)
+    online_added = append_tesco_rows(wb["Online 2026"], online, retail=False)
+    summary = update_tesco_summary(wb, retail, online)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, {
+        "Retail 2026 matching records": len(retail),
+        "Retail 2026 new rows": retail_added,
+        "Online 2026 matching records": len(online),
+        "Online 2026 new rows": online_added,
+    }, summary
+
+
+
+def coop_mask(df: pd.DataFrame):
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    coop_code = df["site_code"].astype(str).str.strip().str.casefold().str.startswith("cooptcg")
+    online_items = df["item_to_order"].astype(str).str.strip().str.casefold().isin(
+        {"home delivery", "rapid delivery", "compliance audit"}
+    )
+    return year_2026 & coop_code & ~online_items
+
+
+def append_coop_rows(ws, records: pd.DataFrame):
+    headers = get_headers(ws)
+    id_col = headers.index("ID") + 1 if "ID" in headers else 1
+    existing_ids = {
+        str(ws.cell(row, id_col).value).strip()
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, id_col).value not in (None, "")
+    }
+    pending = records.loc[~records["internal_id"].astype(str).str.strip().isin(existing_ids)]
+    aliases = {
+        "ID": "internal_id",
+        "Retailer": "retailer",
+        "Premises Name": "site_name",
+        "Address": "site_address_1",
+        "Post Code": "site_post_code",
+        "Date of visit": "date_of_visit",
+        "Time of visit": "time_of_visit",
+        "Site Code": "site_code",
+        "Pass/Fail": "primary_result",
+    }
+    for _, record in pending.iterrows():
+        row_num = ws.max_row + 1
+        template_row = row_num - 1 if row_num > 2 else 2
+        for col_num, header in enumerate(headers, start=1):
+            if not header:
+                continue
+            key = str(header).strip()
+            source_key = aliases.get(key, key)
+            value = record.get(source_key, "")
+            if key == "Pass/Fail":
+                result = str(value).strip().casefold()
+                value = "Pass" if result in ("pass", "passed") else "Fail" if result in ("fail", "failed") else "Abort" if result in ("abort", "aborted") else value
+            cell = ws.cell(row=row_num, column=col_num)
+            set_cell_value(cell, value, key)
+            if template_row >= 2 and template_row < row_num:
+                src = ws.cell(row=template_row, column=col_num)
+                if src.has_style:
+                    cell._style = copy.copy(src._style)
+                if src.number_format:
+                    cell.number_format = src.number_format
+                if src.alignment:
+                    cell.alignment = copy.copy(src.alignment)
+                if src.protection:
+                    cell.protection = copy.copy(src.protection)
+    return len(pending)
+
+
+def update_coop_summary(wb, rows: pd.DataFrame):
+    ws = wb["Summary"]
+    month_columns = {
+        str(ws.cell(3, col).value or "").strip().upper()[:3]: col
+        for col in range(2, 14)
+        if ws.cell(3, col).value
+    }
+    dated = rows.copy()
+    dated["_date"] = pd.to_datetime(dated["date_of_visit"], dayfirst=True, errors="coerce")
+    dated = dated[dated["_date"].dt.year.eq(2026)].copy()
+    dated["_month"] = dated["_date"].dt.strftime("%b").str.upper()
+    dated["_result"] = dated["primary_result"].astype(str).str.strip().str.casefold()
+    updates = {}
+    for month in set(dated["_month"].dropna()):
+        if month not in month_columns:
+            continue
+        col = month_columns[month]
+        mr = dated[dated["_month"] == month]
+        passed = int(mr["_result"].isin(["pass", "passed"]).sum())
+        failed = int(mr["_result"].isin(["fail", "failed"]).sum())
+        aborted = int(mr["_result"].isin(["abort", "aborted"]).sum())
+        ws.cell(4, col).value = passed + failed + aborted
+        ws.cell(5, col).value = passed
+        ws.cell(6, col).value = failed
+        ws.cell(7, col).value = aborted
+        letter = ws.cell(1, col).column_letter
+        ws.cell(8, col).value = f"=IFERROR({letter}5/({letter}4-{letter}7),0)"
+        updates[month] = {"Visits": passed + failed + aborted, "Pass": passed, "Fail": failed, "Abort": aborted}
+    return updates
+
+
+def build_coop_workbook(template_file, df):
+    template_file.seek(0)
+    wb = load_workbook(template_file)
+    for required in ["Summary", "2026"]:
+        if required not in wb.sheetnames:
+            raise ValueError(f"The Co-operative workbook is missing worksheet: {required}")
+    selected = df.loc[coop_mask(df)].copy()
+    added = append_coop_rows(wb["2026"], selected)
+    summary = update_coop_summary(wb, selected)
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, {"2026 matching records": len(selected), "2026 new rows": added}, summary
+
+
+
+def waitrose_retail_mask(df: pd.DataFrame):
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    retail_code = df["site_code"].astype(str).str.strip().str.upper().str.startswith("WAI")
+    online_items = df["item_to_order"].astype(str).str.strip().str.casefold().isin(
+        {"home delivery", "rapid delivery", "compliance audit"}
+    )
+    return year_2026 & retail_code & ~online_items
+
+
+def waitrose_online_mask(df: pd.DataFrame):
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    return year_2026 & df["site_name"].map(norm).eq(norm("Waitrose.co.uk"))
+
+
+def append_waitrose_rows(ws, records: pd.DataFrame):
+    headers = get_headers(ws)
+    id_col = headers.index("internal_id") + 1 if "internal_id" in headers else 1
+    existing_ids = {
+        str(ws.cell(row, id_col).value).strip()
+        for row in range(2, ws.max_row + 1)
+        if ws.cell(row, id_col).value not in (None, "")
+    }
+    pending = records.loc[~records["internal_id"].astype(str).str.strip().isin(existing_ids)]
+    for _, record in pending.iterrows():
+        row_num = ws.max_row + 1
+        template_row = row_num - 1 if row_num > 2 else 2
+        for col_num, header in enumerate(headers, start=1):
+            if not header:
+                continue
+            key = str(header).strip()
+            value = record.get(key, "")
+            cell = ws.cell(row=row_num, column=col_num)
+            set_cell_value(cell, value, key)
+            if 2 <= template_row < row_num:
+                src = ws.cell(row=template_row, column=col_num)
+                if src.has_style:
+                    cell._style = copy.copy(src._style)
+                if src.number_format:
+                    cell.number_format = src.number_format
+                if src.alignment:
+                    cell.alignment = copy.copy(src.alignment)
+                if src.protection:
+                    cell.protection = copy.copy(src.protection)
+    return len(pending)
+
+
+def update_waitrose_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.DataFrame):
+    ws = wb["Pass %"]
+    # Retail metrics occupy rows 5-9; online metrics occupy rows 13-17.
+    sections = [(retail_rows, 5), (online_rows, 13)]
+    updates = {}
+    for rows, visits_row in sections:
+        dated = rows.copy()
+        dated["_date"] = pd.to_datetime(dated["date_of_visit"], dayfirst=True, errors="coerce")
+        dated = dated[dated["_date"].dt.year.eq(2026)].copy()
+        dated["_month"] = dated["_date"].dt.strftime("%b").str.upper()
+        dated["_result"] = dated["primary_result"].astype(str).str.strip().str.casefold()
+        for month in dated["_month"].dropna().unique():
+            col = next(
+                (c for c in range(2, 14)
+                 if str(ws.cell(4 if visits_row == 5 else 12, c).value or "").strip().upper() == month),
+                None,
+            )
+            if col is None:
+                continue
+            mr = dated[dated["_month"] == month]
+            passed = int(mr["_result"].isin(["pass", "passed"]).sum())
+            failed = int(mr["_result"].isin(["fail", "failed"]).sum())
+            aborted = int(mr["_result"].isin(["abort", "aborted"]).sum())
+            ws.cell(visits_row, col).value = passed + failed + aborted
+            ws.cell(visits_row + 1, col).value = passed
+            ws.cell(visits_row + 2, col).value = failed
+            ws.cell(visits_row + 3, col).value = aborted
+            letter = ws.cell(1, col).column_letter
+            ws.cell(visits_row + 4, col).value = (
+                f"=IFERROR({letter}{visits_row+1}/({letter}{visits_row}-{letter}{visits_row+3}),0)"
+            )
+            updates[f"{'Retail' if visits_row == 5 else 'Online'} - {month.title()}"] = {
+                "Visits": passed + failed + aborted,
+                "Pass": passed, "Fail": failed, "Abort": aborted,
+            }
+        # Refresh YTD figures in column O based on Jan-Dec monthly values.
+        for offset in range(4):
+            row = visits_row + offset
+            ws.cell(row, 15).value = f"=SUM(B{row}:M{row})"
+        ws.cell(visits_row + 4, 15).value = (
+            f"=IFERROR(O{visits_row+1}/(O{visits_row}-O{visits_row+3}),0)"
+        )
+    return updates
+
+
+def build_waitrose_workbook(template_file, df):
+    template_file.seek(0)
+    wb = load_workbook(template_file)
+    for required in ["Pass %", "2026 Retail", "2026 Online"]:
+        if required not in wb.sheetnames:
+            raise ValueError(f"Waitrose workbook is missing worksheet: {required}")
+    retail = df.loc[waitrose_retail_mask(df)].copy()
+    online = df.loc[waitrose_online_mask(df)].copy()
+    retail_added = append_waitrose_rows(wb["2026 Retail"], retail)
+    online_added = append_waitrose_rows(wb["2026 Online"], online)
+    summary = update_waitrose_summary(wb, retail, online)
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, {
+        "2026 Retail matching records": len(retail),
+        "2026 Retail new rows": retail_added,
+        "2026 Online matching records": len(online),
+        "2026 Online new rows": online_added,
+    }, summary
+
+
+
+def allocation_audit(df, file1_template=None, sainsbury_template=None,
+                      tesco_template=None, coop_template=None, waitrose_template=None):
+    """Return source rows not assigned to a known report and IDs assigned to multiple report buckets."""
+    assigned = {}
+    year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+    item = df["item_to_order"].astype(str).str.strip().str.casefold()
+    code = df["site_code"].astype(str).str.strip().str.upper()
+    names = df["site_name"].map(norm)
+
+    if file1_template is not None:
+        file1_template.seek(0)
+        wb = load_workbook(file1_template, read_only=True, data_only=True)
+        for sheet, item_name in [("2026 Indy", "e-cig - no id"),
+                                 ("2026 Qcomm", "rapid delivery"),
+                                 ("2026 16-17 YOs", "home delivery")]:
+            if sheet not in wb.sheetnames:
+                continue
+            if sheet == "2026 Indy":
+                whsmith = df.apply(is_whsmith, axis=1)
+                assigned[sheet] = item.eq(item_name) & (
+                    code.str.startswith(("IND", "BAT", "C0")) | whsmith
+                )
+            else:
+                sites = get_site_names(wb[sheet])
+                selected = item.eq(item_name) & names.isin(sites)
+                if sheet == "2026 16-17 YOs" and "order_internal_id" in df.columns:
+                    order_ids = set(df.loc[selected, "order_internal_id"].astype(str).str.strip()) - {""}
+                    selected = selected | (item.eq(item_name) & df["order_internal_id"].astype(str).str.strip().isin(order_ids))
+                assigned[sheet] = selected
+    if sainsbury_template is not None:
+        assigned["Sainsbury Online"] = year_2026 & item.eq("home delivery") & df["site_name"].astype(str).str.contains(
+            r"sainsbury[’']?s", case=False, regex=True, na=False
+        )
+        assigned["Sainsbury Retail"] = year_2026 & code.str.startswith("SAI") & ~item.isin(
+            {"home delivery", "rapid delivery"}
+        )
+    if tesco_template is not None:
+        assigned["Tesco Online"] = year_2026 & item.eq("home delivery") & df["site_name"].astype(str).str.contains(
+            r"tesco\.co\.uk", case=False, regex=True, na=False
+        )
+        assigned["Tesco Retail"] = year_2026 & code.str.startswith("TES") & ~item.isin(
+            {"home delivery", "rapid delivery"}
+        )
+    if coop_template is not None:
+        assigned["The Co-operative"] = year_2026 & code.str.casefold().str.startswith("COOPTCG") & ~item.isin(
+            {"home delivery", "rapid delivery"}
+        )
+    if waitrose_template is not None:
+        assigned["Waitrose Online"] = year_2026 & names.eq(norm("Waitrose.co.uk")) & item.eq("home delivery")
+        assigned["Waitrose Retail"] = year_2026 & code.str.startswith("WAI") & ~item.isin(
+            {"home delivery", "rapid delivery"}
+        )
+
+    if not assigned:
+        return pd.DataFrame(), pd.DataFrame()
+    # Compliance Audit is intentionally excluded from client workbooks, not an allocation failure.
+    compliance = item.eq("compliance audit")
+    assigned = {name: (mask & ~compliance) for name, mask in assigned.items()}
+    matrix = pd.DataFrame({name: mask.reindex(df.index, fill_value=False) for name, mask in assigned.items()})
+    count = matrix.sum(axis=1)
+    unallocated = df.loc[count.eq(0)].copy()
+    overlapping = df.loc[count.gt(1)].copy()
+    if not unallocated.empty:
+        unallocated.insert(0, "allocation_status", "Unallocated")
+    if not overlapping.empty:
+        overlapping.insert(0, "allocation_status", "Multiple report matches")
+        overlapping.insert(1, "matched_reports", matrix.loc[count.gt(1)].apply(
+            lambda row: ", ".join(row.index[row.values].tolist()), axis=1
+        ).values)
+    return unallocated, overlapping
+
+
+st.title("Client Audit Reporting")
+st.write(
+    "Upload the latest audit export and the existing client workbook. "
+    "The app applies report-specific filters and keeps the workbook's existing columns unchanged."
+)
+
+with st.sidebar:
+    st.header("Report rules")
+    st.markdown(
+        "- **2026 Indy:** `E-Cig - No ID` plus site codes beginning `IND`, `BAT`, or `C0`, "
+        "and WHSmith sites.\n"
+        "- **2026 Qcomm:** `Rapid Delivery` at site names already present in the Qcomm sheet.\n"
+        "- **2026 16-17 YOs:** `Home Delivery` at site names already present in that sheet, plus Home Delivery audits sharing the same `order_internal_id` as an eligible audit.\n\n"
+        "Records not selected for these sheets are not deleted from the source export."
+    )
+
+csv_file = st.file_uploader("1. Audit export (CSV)", type=["csv"])
+order_reference_file = st.file_uploader(
+    "Optional: full source export with order_internal_id (CSV)",
+    type=["csv"],
+    help="If the main export lacks order_internal_id, upload the original/full export here. It is joined by internal_id and used only to enrich order-number matching."
+)
+left, right = st.columns(2)
+with left:
+    template_file = st.file_uploader("2. Qcomm, 16-17 YOs, Indy template (XLSX)", type=["xlsx"])
+with right:
+    sainsbury_template = st.file_uploader("3. File 2 template — Sainsbury's (XLSX)", type=["xlsx"])
+tesco_template = st.file_uploader("4. File 3 template — Tesco (XLSX)", type=["xlsx"])
+coop_template = st.file_uploader("5. File 4 template — The Co-operative (XLSX)", type=["xlsx"])
+waitrose_template = st.file_uploader("6. File 5 template — Waitrose (XLSX)", type=["xlsx"])
+
+if csv_file and (template_file or sainsbury_template or tesco_template or coop_template or waitrose_template):
+    try:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+        missing = REQUIRED_SOURCE_COLUMNS - set(df.columns)
+        if missing:
+            st.error("The audit export is missing required columns: " + ", ".join(sorted(missing)))
+            st.stop()
+
+        # If the main report export omits order_internal_id, enrich it from the
+        # original/full export using the stable audit ID. Do not add rows from
+        # the reference export; it only supplies order-number metadata.
+        if "order_internal_id" not in df.columns and order_reference_file is not None:
+            reference_df = pd.read_csv(order_reference_file, dtype=str, keep_default_na=False)
+            if {"internal_id", "order_internal_id"}.issubset(reference_df.columns):
+                reference = reference_df[["internal_id", "order_internal_id"]].copy()
+                reference["internal_id"] = reference["internal_id"].astype(str).str.strip()
+                reference = reference.drop_duplicates(subset=["internal_id"], keep="first")
+                df["internal_id"] = df["internal_id"].astype(str).str.strip()
+                df = df.merge(reference, on="internal_id", how="left", validate="many_to_one")
+                matched_orders = df["order_internal_id"].astype(str).str.strip().ne("").sum()
+                st.success(f"Order numbers linked from the full export for {matched_orders:,} audit records.")
+            else:
+                st.warning("The optional full export must contain both `internal_id` and `order_internal_id`; order-number matching is unavailable.")
+
+        if template_file:
+            template_file.seek(0)
+            wb_check = load_workbook(template_file, read_only=True, data_only=True)
+            missing_sheets = set(REPORT_SHEETS) - set(wb_check.sheetnames)
+            if missing_sheets:
+                st.error("The Qcomm, 16-17 YOs, Indy workbook is missing required sheets: " + ", ".join(sorted(missing_sheets)))
+                st.stop()
+        if sainsbury_template:
+            sainsbury_template.seek(0)
+            sains_check = load_workbook(sainsbury_template, read_only=True, data_only=True)
+            missing_sains = {"Summary", "Online 26", "2026"} - set(sains_check.sheetnames)
+            if missing_sains:
+                st.error("The Sainsbury's workbook is missing required sheets: " + ", ".join(sorted(missing_sains)))
+                st.stop()
+
+        if tesco_template:
+            tesco_template.seek(0)
+            tesco_check = load_workbook(tesco_template, read_only=True, data_only=True)
+            missing_tesco = {"Summary", "Retail 2026", "Online 2026"} - set(tesco_check.sheetnames)
+            if missing_tesco:
+                st.error("The Tesco workbook is missing required sheets: " + ", ".join(sorted(missing_tesco)))
+                st.stop()
+
+        if coop_template:
+            coop_template.seek(0)
+            coop_check = load_workbook(coop_template, read_only=True, data_only=True)
+            missing_coop = {"Summary", "2026"} - set(coop_check.sheetnames)
+            if missing_coop:
+                st.error("The Co-operative workbook is missing required sheets: " + ", ".join(sorted(missing_coop)))
+                st.stop()
+
+        if waitrose_template:
+            waitrose_template.seek(0)
+            waitrose_check = load_workbook(waitrose_template, read_only=True, data_only=True)
+            missing_waitrose = {"Pass %", "2026 Retail", "2026 Online"} - set(waitrose_check.sheetnames)
+            if missing_waitrose:
+                st.error("The Waitrose workbook is missing required sheets: " + ", ".join(sorted(missing_waitrose)))
+                st.stop()
+
+        st.subheader("Source data")
+        a, b, c = st.columns(3)
+        a.metric("Audit records in export", f"{len(df):,}")
+        b.metric("Columns in export", f"{len(df.columns):,}")
+        c.metric("Distinct audit IDs", f"{df['internal_id'].nunique():,}")
+
+        if "order_internal_id" not in df.columns or not df["order_internal_id"].astype(str).str.strip().ne("").any():
+            st.warning(
+                "No usable `order_internal_id` values are available. The Totally Wicked / 16-17 YOs "
+                "sibling-audit rule needs the full source export; upload it in the optional field above."
+            )
+
+        if template_file:
+            if st.button("Build Qcomm, 16-17 YOs, Indy report", type="primary"):
+                output, results, unmatched, pass_summary = workbook_bytes(df=df, template_file=template_file)
+                st.session_state["report_bytes"] = output.getvalue()
+                st.session_state["report_results"] = results
+                st.session_state["report_unmatched"] = unmatched
+                st.session_state["pass_summary"] = pass_summary
+                st.session_state["source_filename"] = csv_file.name
+
+        if "report_results" in st.session_state:
+            st.subheader("Processing summary")
+            result_df = pd.DataFrame(st.session_state["report_results"]).T
+            result_df.index.name = "Worksheet"
+            st.dataframe(result_df, use_container_width=True)
+
+            st.subheader("Pass % tab updates")
+            pass_summary = st.session_state.get("pass_summary", {})
+            if pass_summary:
+                pass_df = pd.DataFrame(pass_summary).T
+                pass_df.index.name = "Report section / month"
+                st.dataframe(pass_df, use_container_width=True)
+            else:
+                st.info("No relevant dated records were found to update the Pass % tab.")
+
+            st.download_button(
+                "Download populated client workbook",
+                data=st.session_state["report_bytes"],
+                file_name="Qcomm, 16-17 YOs, Indy_updated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+
+            st.subheader("Site names to review")
+            st.caption(
+                "These records match the audit type but their site names are not currently listed "
+                "in the corresponding sheet. They are not added automatically."
+            )
+            for sheet_name, rows in st.session_state["report_unmatched"].items():
+                if len(rows):
+                    with st.expander(f"{sheet_name}: {len(rows)} unmatched records"):
+                        cols = [c for c in ["internal_id", "site_code", "site_name", "item_to_order", "date_of_visit", "primary_result"] if c in rows.columns]
+                        st.dataframe(rows[cols], use_container_width=True, hide_index=True)
+                else:
+                    st.success(f"{sheet_name}: no unmatched site names for the relevant audit type.")
+        if sainsbury_template:
+            if st.button("Build Sainsbury's report"):
+                sains_output, sains_results, sains_summary = build_sainsbury_workbook(sainsbury_template, df)
+                st.session_state["sains_report_bytes"] = sains_output.getvalue()
+                st.session_state["sains_report_results"] = sains_results
+                st.session_state["sains_summary"] = sains_summary
+            if "sains_report_results" in st.session_state:
+                st.subheader("Sainsbury's processing summary")
+                st.dataframe(pd.DataFrame(st.session_state["sains_report_results"], index=["Count"]).T,
+                             use_container_width=True)
+                if st.session_state.get("sains_summary"):
                     st.dataframe(pd.DataFrame(st.session_state["sains_summary"]).T,
                                  use_container_width=True)
                 st.download_button(
