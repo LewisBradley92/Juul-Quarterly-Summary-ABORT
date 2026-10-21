@@ -208,7 +208,7 @@ def update_pass_percent_sheet(wb, df: pd.DataFrame):
     return summary
 
 
-def workbook_bytes(template_file, df):
+def workbook_bytes(template_file, df, sainsbury_template=None, tesco_template=None, coop_template=None, waitrose_template=None):
     template_file.seek(0)
     wb = load_workbook(template_file)
     results = {}
@@ -218,6 +218,26 @@ def workbook_bytes(template_file, df):
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Template is missing the required worksheet: {sheet_name}")
         selected, unmatched_rows = filter_for_sheet(df, sheet_name, wb[sheet_name])
+        # Indy E-Cig - No ID fallback: only add rows not eligible for another client.
+        if sheet_name == "2026 Indy":
+            year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
+            item = df["item_to_order"].astype(str).str.strip().str.casefold()
+            other_masks = []
+            if sainsbury_template is not None:
+                other_masks.extend([sainsbury_online_mask(df) & year_2026, sainsbury_retail_mask(df)])
+            if tesco_template is not None:
+                other_masks.extend([tesco_online_mask(df), tesco_retail_mask(df)])
+            if coop_template is not None:
+                other_masks.append(coop_mask(df))
+            if waitrose_template is not None:
+                other_masks.extend([waitrose_online_mask(df), waitrose_retail_mask(df)])
+            matched_elsewhere = pd.concat(other_masks, axis=1).any(axis=1) if other_masks else pd.Series(False, index=df.index)
+            fallback = year_2026 & item.eq("e-cig - no id") & ~matched_elsewhere
+            selected = df.loc[selected.index.isin(df.index) & (selected.index.to_series().isin(selected.index))].copy() if False else selected
+            selected = pd.concat([selected, df.loc[fallback]], axis=0).drop_duplicates(subset=["internal_id"])
+            unmatched_rows = unmatched_rows.loc[
+                ~unmatched_rows["internal_id"].astype(str).isin(selected["internal_id"].astype(str))
+            ]
         added, duplicates_removed = append_rows(wb[sheet_name], selected)
         results[sheet_name] = {
             "matching_source_records": len(selected),
@@ -695,7 +715,7 @@ def build_waitrose_workbook(template_file, df):
 
 def allocation_audit(df, file1_template=None, sainsbury_template=None,
                       tesco_template=None, coop_template=None, waitrose_template=None):
-    """Return source rows not assigned to a known report and IDs assigned to multiple report buckets."""
+    """Classify each audit using the same masks used by workbook generation."""
     assigned = {}
     year_2026 = pd.to_datetime(df["date_of_visit"], dayfirst=True, errors="coerce").dt.year.eq(2026)
     item = df["item_to_order"].astype(str).str.strip().str.casefold()
@@ -712,57 +732,75 @@ def allocation_audit(df, file1_template=None, sainsbury_template=None,
                 continue
             if sheet == "2026 Indy":
                 whsmith = df.apply(is_whsmith, axis=1)
-                assigned[sheet] = item.eq(item_name) & (
+                assigned[sheet] = year_2026 & item.eq(item_name) & (
                     code.str.startswith(("IND", "BAT", "C0")) | whsmith
                 )
             else:
                 sites = get_site_names(wb[sheet])
-                selected = item.eq(item_name) & names.isin(sites)
+                selected = year_2026 & item.eq(item_name) & names.isin(sites)
                 if sheet == "2026 16-17 YOs" and "order_internal_id" in df.columns:
-                    order_ids = set(df.loc[selected, "order_internal_id"].astype(str).str.strip()) - {""}
-                    selected = selected | (item.eq(item_name) & df["order_internal_id"].astype(str).str.strip().isin(order_ids))
+                    order_values = df["order_internal_id"].astype(str).str.strip()
+                    eligible_orders = set(order_values.loc[selected]) - {""}
+                    selected = selected | (year_2026 & item.eq(item_name) & order_values.isin(eligible_orders))
                 assigned[sheet] = selected
+
     if sainsbury_template is not None:
-        assigned["Sainsbury Online"] = year_2026 & item.eq("home delivery") & df["site_name"].astype(str).str.contains(
-            r"sainsbury[’']?s", case=False, regex=True, na=False
-        )
-        assigned["Sainsbury Retail"] = year_2026 & code.str.startswith("SAI") & ~item.isin(
-            {"home delivery", "rapid delivery"}
-        )
+        assigned["Sainsbury Online"] = sainsbury_online_mask(df) & year_2026
+        assigned["Sainsbury Retail"] = sainsbury_retail_mask(df)
     if tesco_template is not None:
-        assigned["Tesco Online"] = year_2026 & item.eq("home delivery") & df["site_name"].astype(str).str.contains(
-            r"tesco\.co\.uk", case=False, regex=True, na=False
-        )
-        assigned["Tesco Retail"] = year_2026 & code.str.startswith("TES") & ~item.isin(
-            {"home delivery", "rapid delivery"}
-        )
+        assigned["Tesco Online"] = tesco_online_mask(df)
+        assigned["Tesco Retail"] = tesco_retail_mask(df)
     if coop_template is not None:
-        assigned["The Co-operative"] = year_2026 & code.str.casefold().str.startswith("COOPTCG") & ~item.isin(
-            {"home delivery", "rapid delivery"}
-        )
+        assigned["The Co-operative"] = coop_mask(df)
     if waitrose_template is not None:
-        assigned["Waitrose Online"] = year_2026 & names.eq(norm("Waitrose.co.uk")) & item.eq("home delivery")
-        assigned["Waitrose Retail"] = year_2026 & code.str.startswith("WAI") & ~item.isin(
-            {"home delivery", "rapid delivery"}
-        )
+        assigned["Waitrose Online"] = waitrose_online_mask(df)
+        assigned["Waitrose Retail"] = waitrose_retail_mask(df)
 
     if not assigned:
-        return pd.DataFrame(), pd.DataFrame()
-    # Compliance Audit is intentionally excluded from client workbooks, not an allocation failure.
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Compliance Audit is intentionally excluded from all client reports.
     compliance = item.eq("compliance audit")
     assigned = {name: (mask & ~compliance) for name, mask in assigned.items()}
+
+    # E-Cig - No ID is a fallback to Indy only if no other client rule matches.
+    # Use the exact same client-rule masks as the review and report builders.
+    e_cig = year_2026 & item.eq("e-cig - no id")
+    other_masks = [mask for name, mask in assigned.items() if name != "2026 Indy"]
+    matched_elsewhere = (
+        pd.concat(other_masks, axis=1).any(axis=1)
+        if other_masks else pd.Series(False, index=df.index)
+    )
+    if file1_template is not None and "2026 Indy" in assigned:
+        assigned["2026 Indy"] = assigned["2026 Indy"] | (e_cig & ~matched_elsewhere)
+
     matrix = pd.DataFrame({name: mask.reindex(df.index, fill_value=False) for name, mask in assigned.items()})
     count = matrix.sum(axis=1)
-    unallocated = df.loc[count.eq(0)].copy()
+    unallocated = df.loc[count.eq(0) & ~compliance].copy()
     overlapping = df.loc[count.gt(1)].copy()
     if not unallocated.empty:
         unallocated.insert(0, "allocation_status", "Unallocated")
+        def reason(row):
+            val = norm(row.get("item_to_order", ""))
+            if val == "compliance audit":
+                return "Intentionally excluded"
+            if val == "e-cig - no id":
+                return "E-Cig - No ID did not match another client rule and was not eligible for Indy under current year/site rules"
+            if val == "home delivery" and norm(row.get("site_name", "")) == norm("Totally Wicked"):
+                return "Totally Wicked Home Delivery: no matching order_internal_id linked to an eligible 16-17 YOs audit"
+            if val in {"rapid delivery", "home delivery"}:
+                return "Audit type found, but site/order did not match a report tab's eligibility rules"
+            return "No configured client report rule matched this audit"
+        unallocated.insert(1, "allocation_reason", unallocated.apply(reason, axis=1))
     if not overlapping.empty:
         overlapping.insert(0, "allocation_status", "Multiple report matches")
         overlapping.insert(1, "matched_reports", matrix.loc[count.gt(1)].apply(
             lambda row: ", ".join(row.index[row.values].tolist()), axis=1
         ).values)
-    return unallocated, overlapping
+    excluded = df.loc[compliance].copy()
+    if not excluded.empty:
+        excluded.insert(0, "allocation_status", "Intentionally excluded — Compliance Audit")
+    return unallocated, overlapping, excluded
 
 
 st.title("Client Audit Reporting")
@@ -791,7 +829,7 @@ tesco_template = st.file_uploader("4. File 3 template — Tesco (XLSX)", type=["
 coop_template = st.file_uploader("5. File 4 template — The Co-operative (XLSX)", type=["xlsx"])
 waitrose_template = st.file_uploader("6. File 5 template — Waitrose (XLSX)", type=["xlsx"])
 
-if csv_file and (template_file or sainsbury_template or tesco_template or coop_template or waitrose_template):
+if all([csv_file, template_file, sainsbury_template, tesco_template, coop_template, waitrose_template]):
     try:
         df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
         missing = REQUIRED_SOURCE_COLUMNS - set(df.columns)
@@ -846,13 +884,13 @@ if csv_file and (template_file or sainsbury_template or tesco_template or coop_t
 
         if "order_internal_id" not in df.columns or not df["order_internal_id"].astype(str).str.strip().ne("").any():
             st.warning(
-                "No usable `order_internal_id` values are available. The Totally Wicked / 16-17 YOs "
-                "sibling-audit rule needs the full source export; upload it in the optional field above."
+                "The main audit export has no usable `order_internal_id` values. The app cannot "
+                "match sibling Home Delivery audits by order number; those audits will be highlighted for review."
             )
 
         if template_file:
             if st.button("Build Qcomm, 16-17 YOs, Indy report", type="primary"):
-                output, results, unmatched, pass_summary = workbook_bytes(df=df, template_file=template_file)
+                output, results, unmatched, pass_summary = workbook_bytes(df=df, template_file=template_file, sainsbury_template=sainsbury_template, tesco_template=tesco_template, coop_template=coop_template, waitrose_template=waitrose_template)
                 st.session_state["report_bytes"] = output.getvalue()
                 st.session_state["report_results"] = results
                 st.session_state["report_unmatched"] = unmatched
@@ -981,17 +1019,16 @@ if csv_file and (template_file or sainsbury_template or tesco_template or coop_t
         st.divider()
         st.subheader("Post-build audit checks")
         st.caption("Highlighted rows are source audits not assigned by the active report rules. Compliance Audit records are intentionally excluded. E-Cig - No ID records still need the Indy fallback applied after checking all other client rules; they must not be treated as allocated until they appear in the generated Indy workbook.")
-        unallocated, overlapping = allocation_audit(
+        unallocated, overlapping, compliance_excluded = allocation_audit(
             df, template_file, sainsbury_template, tesco_template, coop_template, waitrose_template
         )
-        compliance_excluded = df.loc[df["item_to_order"].astype(str).str.strip().str.casefold().eq("compliance audit")].copy()
         m1, m2, m3 = st.columns(3)
         m1.metric("Audits not added", len(unallocated))
         m2.metric("Audits matching multiple reports", len(overlapping))
         m3.metric("Compliance Audit intentionally excluded", len(compliance_excluded))
         if not unallocated.empty:
             st.warning("Review these audits: they did not match any of the uploaded report rules and will not be added to a workbook.")
-            preview_cols = [c for c in ["internal_id", "date_of_visit", "item_to_order", "site_name", "site_code", "primary_result"] if c in unallocated.columns]
+            preview_cols = [c for c in ["internal_id", "allocation_reason", "date_of_visit", "item_to_order", "site_name", "site_code", "primary_result"] if c in unallocated.columns]
             highlighted = unallocated[preview_cols].style.apply(lambda row: ["background-color: #ffe0e0; color: #7f1d1d"] * len(row), axis=1)
             st.dataframe(highlighted, use_container_width=True, hide_index=True)
             st.download_button(
@@ -1020,4 +1057,15 @@ if csv_file and (template_file or sainsbury_template or tesco_template or coop_t
     except Exception as exc:
         st.error(f"Could not process these files: {exc}")
 else:
-    st.info("Upload the audit export and at least one existing client workbook to enable report processing.")
+    st.info("Report processing is locked until all six required files have been uploaded.")
+    required_uploads = [
+        ("Audit export CSV", csv_file),
+        ("Qcomm, 16-17 YOs, Indy workbook", template_file),
+        ("Sainsbury's workbook", sainsbury_template),
+        ("Tesco workbook", tesco_template),
+        ("The Co-operative workbook", coop_template),
+        ("Waitrose workbook", waitrose_template),
+    ]
+    for label, uploaded in required_uploads:
+        st.write(("✅ " if uploaded else "⬜ ") + label)
+    st.caption("Upload the missing file(s) above. No report building or allocation checks will run until every required file is present.")
