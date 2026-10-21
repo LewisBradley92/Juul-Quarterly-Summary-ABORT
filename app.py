@@ -782,11 +782,6 @@ with st.sidebar:
     )
 
 csv_file = st.file_uploader("1. Audit export (CSV)", type=["csv"])
-order_reference_file = st.file_uploader(
-    "Optional: full source export with order_internal_id (CSV)",
-    type=["csv"],
-    help="If the main export lacks order_internal_id, upload the original/full export here. It is joined by internal_id and used only to enrich order-number matching."
-)
 left, right = st.columns(2)
 with left:
     template_file = st.file_uploader("2. Qcomm, 16-17 YOs, Indy template (XLSX)", type=["xlsx"])
@@ -803,22 +798,6 @@ if csv_file and (template_file or sainsbury_template or tesco_template or coop_t
         if missing:
             st.error("The audit export is missing required columns: " + ", ".join(sorted(missing)))
             st.stop()
-
-        # If the main report export omits order_internal_id, enrich it from the
-        # original/full export using the stable audit ID. Do not add rows from
-        # the reference export; it only supplies order-number metadata.
-        if "order_internal_id" not in df.columns and order_reference_file is not None:
-            reference_df = pd.read_csv(order_reference_file, dtype=str, keep_default_na=False)
-            if {"internal_id", "order_internal_id"}.issubset(reference_df.columns):
-                reference = reference_df[["internal_id", "order_internal_id"]].copy()
-                reference["internal_id"] = reference["internal_id"].astype(str).str.strip()
-                reference = reference.drop_duplicates(subset=["internal_id"], keep="first")
-                df["internal_id"] = df["internal_id"].astype(str).str.strip()
-                df = df.merge(reference, on="internal_id", how="left", validate="many_to_one")
-                matched_orders = df["order_internal_id"].astype(str).str.strip().ne("").sum()
-                st.success(f"Order numbers linked from the full export for {matched_orders:,} audit records.")
-            else:
-                st.warning("The optional full export must contain both `internal_id` and `order_internal_id`; order-number matching is unavailable.")
 
         if template_file:
             template_file.seek(0)
