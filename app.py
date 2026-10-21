@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import zipfile
 import re
 import copy
 import pandas as pd
@@ -201,7 +202,7 @@ def update_pass_percent_sheet(wb, df: pd.DataFrame):
             ws.cell(base + 2, col).value = fails
             ws.cell(base + 3, col).value = aborts
             letter = ws.cell(1, col).column_letter
-            ws.cell(base + 4, col).value = f"=IFERROR({letter}{base+1}/({letter}{base}-{letter}{base+3}),0)"
+            ws.cell(base + 4, col).value = (passes / (passes + fails)) if (passes + fails) else 0
             summary[f"{sheet_name} - {month}"] = {
                 "Visits": visits, "Pass": passes, "Fail": fails, "Abort": aborts
             }
@@ -249,6 +250,12 @@ def workbook_bytes(template_file, df, sainsbury_template=None, tesco_template=No
     pass_summary = update_pass_percent_sheet(wb, df)
 
     output = BytesIO()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
     wb.save(output)
     output.seek(0)
     return output, results, unmatched, pass_summary
@@ -337,9 +344,7 @@ def update_sainsbury_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.Data
             ws.cell(start_row + 2, col).value = failed
             ws.cell(start_row + 3, col).value = aborted
             letter = ws.cell(1, col).column_letter
-            ws.cell(start_row + 4, col).value = (
-                f"=IFERROR({letter}{start_row+1}/({letter}{start_row}-{letter}{start_row+3}),0)"
-            )
+            ws.cell(start_row + 4, col).value = (passed / (passed + failed)) if (passed + failed) else 0
             updates[f"{'Retail' if start_row == 4 else 'Online'} - {month}"] = {
                 "Visits": passed + failed + aborted, "Pass": passed,
                 "Fail": failed, "Abort": aborted
@@ -361,6 +366,12 @@ def build_sainsbury_workbook(template_file, df):
     summary = update_sainsbury_summary(wb, retail, online)
 
     output = BytesIO()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
     wb.save(output)
     output.seek(0)
     return output, {
@@ -461,9 +472,7 @@ def update_tesco_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.DataFram
             ws.cell(start_row + 2, col).value = failed
             ws.cell(start_row + 3, col).value = aborted
             letter = ws.cell(1, col).column_letter
-            ws.cell(start_row + 4, col).value = (
-                f"=IFERROR({letter}{start_row+1}/({letter}{start_row}-{letter}{start_row+3}),0)"
-            )
+            ws.cell(start_row + 4, col).value = (passed / (passed + failed)) if (passed + failed) else 0
             updates[f"{'Retail' if start_row == 4 else 'Online'} - {month}"] = {
                 "Visits": passed + failed + aborted, "Pass": passed,
                 "Fail": failed, "Abort": aborted
@@ -485,6 +494,12 @@ def build_tesco_workbook(template_file, df):
     summary = update_tesco_summary(wb, retail, online)
 
     output = BytesIO()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
     wb.save(output)
     output.seek(0)
     return output, {
@@ -578,7 +593,7 @@ def update_coop_summary(wb, rows: pd.DataFrame):
         ws.cell(6, col).value = failed
         ws.cell(7, col).value = aborted
         letter = ws.cell(1, col).column_letter
-        ws.cell(8, col).value = f"=IFERROR({letter}5/({letter}4-{letter}7),0)"
+        ws.cell(8, col).value = (passed / (passed + failed)) if (passed + failed) else 0
         updates[month] = {"Visits": passed + failed + aborted, "Pass": passed, "Fail": failed, "Abort": aborted}
     return updates
 
@@ -593,6 +608,12 @@ def build_coop_workbook(template_file, df):
     added = append_coop_rows(wb["2026"], selected)
     summary = update_coop_summary(wb, selected)
     output = BytesIO()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
     wb.save(output)
     output.seek(0)
     return output, {"2026 matching records": len(selected), "2026 new rows": added}, summary
@@ -673,19 +694,23 @@ def update_waitrose_summary(wb, retail_rows: pd.DataFrame, online_rows: pd.DataF
             ws.cell(visits_row + 2, col).value = failed
             ws.cell(visits_row + 3, col).value = aborted
             letter = ws.cell(1, col).column_letter
-            ws.cell(visits_row + 4, col).value = (
-                f"=IFERROR({letter}{visits_row+1}/({letter}{visits_row}-{letter}{visits_row+3}),0)"
-            )
+            ws.cell(visits_row + 4, col).value = (passed / (passed + failed)) if (passed + failed) else 0
             updates[f"{'Retail' if visits_row == 5 else 'Online'} - {month.title()}"] = {
                 "Visits": passed + failed + aborted,
                 "Pass": passed, "Fail": failed, "Abort": aborted,
             }
-        # Refresh YTD figures in column O based on Jan-Dec monthly values.
-        for offset in range(4):
-            row = visits_row + offset
-            ws.cell(row, 15).value = f"=SUM(B{row}:M{row})"
+        # Write concrete YTD values so the updated rates are visible immediately,
+        # even in previews that do not recalculate Excel formulas.
+        all_passed = int(dated["_result"].isin(["pass", "passed"]).sum())
+        all_failed = int(dated["_result"].isin(["fail", "failed"]).sum())
+        all_aborted = int(dated["_result"].isin(["abort", "aborted"]).sum())
+        ws.cell(visits_row, 15).value = all_passed + all_failed + all_aborted
+        ws.cell(visits_row + 1, 15).value = all_passed
+        ws.cell(visits_row + 2, 15).value = all_failed
+        ws.cell(visits_row + 3, 15).value = all_aborted
         ws.cell(visits_row + 4, 15).value = (
-            f"=IFERROR(O{visits_row+1}/(O{visits_row}-O{visits_row+3}),0)"
+            all_passed / (all_passed + all_failed)
+            if (all_passed + all_failed) else 0
         )
     return updates
 
@@ -702,6 +727,12 @@ def build_waitrose_workbook(template_file, df):
     online_added = append_waitrose_rows(wb["2026 Online"], online)
     summary = update_waitrose_summary(wb, retail, online)
     output = BytesIO()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
     wb.save(output)
     output.seek(0)
     return output, {
@@ -875,6 +906,47 @@ if all([csv_file, template_file, sainsbury_template, tesco_template, coop_templa
             if missing_waitrose:
                 st.error("The Waitrose workbook is missing required sheets: " + ", ".join(sorted(missing_waitrose)))
                 st.stop()
+
+        st.subheader("Download all reports")
+        st.caption("Builds all five client workbooks using the uploaded audit export and templates, then bundles them into one ZIP file.")
+        if st.button("Build and download all 5 reports", type="primary", key="build_all_reports"):
+            with st.spinner("Building all five client reports..."):
+                all_reports = {}
+                # Build each workbook using the same report-generation functions as the individual buttons.
+                indy_output, indy_results, indy_unmatched, indy_summary = workbook_bytes(
+                    df=df, template_file=template_file,
+                    sainsbury_template=sainsbury_template, tesco_template=tesco_template,
+                    coop_template=coop_template, waitrose_template=waitrose_template
+                )
+                all_reports["Qcomm, 16-17 YOs, Indy_updated.xlsx"] = indy_output.getvalue()
+
+                sains_output, sains_results, sains_summary = build_sainsbury_workbook(sainsbury_template, df)
+                all_reports["Sainsburys_report_updated.xlsx"] = sains_output.getvalue()
+
+                tesco_output, tesco_results, tesco_summary = build_tesco_workbook(tesco_template, df)
+                all_reports["Tesco_report_updated.xlsx"] = tesco_output.getvalue()
+
+                coop_output, coop_results, coop_summary = build_coop_workbook(coop_template, df)
+                all_reports["Cooperative_report_updated.xlsx"] = coop_output.getvalue()
+
+                waitrose_output, waitrose_results, waitrose_summary = build_waitrose_workbook(waitrose_template, df)
+                all_reports["Waitrose_report_updated.xlsx"] = waitrose_output.getvalue()
+
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    for filename, content in all_reports.items():
+                        archive.writestr(filename, content)
+                st.session_state["all_reports_zip"] = zip_buffer.getvalue()
+                st.success("All five reports have been built.")
+
+        if "all_reports_zip" in st.session_state:
+            st.download_button(
+                "Download all 5 reports (ZIP)",
+                data=st.session_state["all_reports_zip"],
+                file_name="client_audit_reports.zip",
+                mime="application/zip",
+                key="download_all_reports",
+            )
 
         st.subheader("Source data")
         a, b, c = st.columns(3)
